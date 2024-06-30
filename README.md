@@ -6,7 +6,7 @@ This project started as a small experiment of how far can you get in sneaking ar
 
 > Contrary to the name, usage of this project *could* break institution internet usage guidelines, be sensible.
 
-# Usage
+## Usage
 
 `btr` supports multiple modes of operation:
 - `btr` tunnels
@@ -35,9 +35,9 @@ This project started as a small experiment of how far can you get in sneaking ar
 
 ### `btr dio` tunnels
 
-`dio` tunnels are a more powerful tunneling method by emulating a pseudo-network layer [protocol](#dio-protocol) over other application protocols. Currently two types of `dio` tunnels are supported: `dio-raw-tun` and `dio-ns-tun`. Both function the same, only changing the transport method used.
+`dio` tunnels are a more powerful tunneling method by emulating a pseudo-network layer protocol over other application protocols. Currently two types of `dio` tunnels are supported: `dio-raw-tun` and `dio-ns-tun`. Both function the same, only changing the transport method used.
 
-`dio` tunnels need a `dio` server listening on the other side, which is started using `dio-serve`. (which listens for all types of `dio` tunnels) `dio` also needs a certificate + private key combo due to using the quic protocol, these can be self-signed and `btr` clients will thrust them automatically.
+`dio` tunnels need a `dio` server listening on the other side, which is started using `dio-serve`. (which listens for all types of `dio` tunnels) `dio` also needs a certificate + private key combo due to using the quic protocol, these can be self-signed and `btr` clients will trust them automatically.
 ```sh
 ./btr3.py dio-serve 0.0.0.0:48001 --cert my_cert.pem --priv my_key.pem --pass my_key_pass
 ```
@@ -59,7 +59,7 @@ The `route-chrome` mode is just a helper which launched a `chrome(ium)` session 
 ./btr3.py route-chrome localhost:1080
 ```
 
-# Technical Overview
+## Technical Overview
 
 This projects goal was to create the most capable proxying service which didn't require any superuser privileges and used as little external dependencies as possible.
 
@@ -77,22 +77,20 @@ This method was fully implemented only using the standard modules and doesn't re
 
 > TL;DR: `dio` is a request based pseudo-[network layer](https://en.wikipedia.org/wiki/OSI_model#Layer_architecture) protocol designed to be transferred over a different application layer protocol
 
-`dio` or (Dns Input Output) is the result of a attempt at a minimal [Dns Tunneling Proxy](https://www.catchpoint.com/network-admin-guide/dns-tunneling). While dns tunneling is often used with malicious intents, it's just another way to transfer data with a remote server *unrestricted*.
+`dio` or (Dns Input Output) is the result of a attempt at a minimal [Dns Tunneling Proxy](https://www.catchpoint.com/network-admin-guide/dns-tunneling). While dns tunneling is often used with malicious intents, it's just another way to transfer data to a remote server *unrestricted*, which can be used by a proxy. 
 
 `dio` itself is a protocol for communicating with a remote server over a udp-like transfer method with no established "connections", it has been designed with dns in focus but it could be easily adapted for any request based protocol which can transfer at least a few bytes per request/response.
 
 When a `dio` client wants to proxy udp like traffic, it requests a `dio link`. `links` are the stand-in for ports and ip addresses in `dio` and are the way servers distinguish clients from one another. `links` provide a unreliable way to proxy udp traffic by sending *up* packets in requests and receiving *down* packets in responses, light packet fragmentation is also supported.
 
 New `links` are communicated using `dio rebind` requests which are the only `dio` specific packets that don't transfer traffic. 
-
-> [!note]
-> Because of the internal layout of `dio`, only 63 simultaneous `links` are supported 
-
 These `links` are then closed after a timeout of no traffic coming trough the `link`. (by default 60 seconds)
+> [!note]
+> Because of the internal layout of `dio`, only 63 simultaneous `links` are supported per server
 
 Because `dio` is a request based protocol, only the client can send packets at any time, server on the other hand has to wait for a request before it can start sending *down* packets to the client. For that reason the client periodically send *heartbeats* if no *up* packets are buffered so any *down* packets buffered on the server can start being transferred.
 
-For the same reason and to allow for bigger time between *heartbeats*, `dio` adapted lazy requests inspired by the [iodine](https://github.com/yarrick/iodine) proxy. The operating using lazy requests, the server does **not** respond to a request immediately instead preferring to always keep one request in its awaiting state so it can respond immediately when new *down* packets arrive, avoiding the need to wait for a *heartbeat* request.
+For the same reason and to allow for bigger pauses between *heartbeats*, `dio` adapts lazy requests inspired by the [iodine](https://github.com/yarrick/iodine) proxy. When operating using lazy requests, the server does **not** respond to a request immediately instead preferring to always keep one request in its awaiting state so it can respond immediately when new *down* packets arrive, avoiding the need to wait for a *heartbeat* request.
 
 Here's a diagram of a client and a server proxying a `link` with lazy requests
 ```mermaid
@@ -121,7 +119,7 @@ sequenceDiagram
 	Note over C,P: not in lazy mode<br/>wait for heartbeat
 	C-->>+P: link_id: 5, heartbeat
 	P->>-C: link_id: 5, "down3" data
-	Note right of P: no more data,<br/>request heartbeat<br/>as lazy request
+	Note right of P: no more data,<br/>request heartbeat<br/>to start lazy mode
 	C-->>+P: link_id: 5, heartbeat
 ```
 
