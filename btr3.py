@@ -189,37 +189,6 @@ import threading
 import time
 import select
 
-# dio fragment ordering algo: receive and order frag packets until all received
-# if all frags arrived by the time all packet arrives, packet is sent, if not, packet is considered lost (no wait)
-
-# TODO: tcp-over-quic integration 
-
-@dataclasses.dataclass(kw_only=True)
-class DioLink:
-    out_sock: socket.socket = dataclasses.field(init=False)
-    out_addr: tuple[str, int] = dataclasses.field(default_factory=tuple)
-
-    lazy_addr: tuple[str, int] | None = None
-    down_buffer: list[bytes] = dataclasses.field(default_factory=list) # buffered downstream packets
-
-    # down remaining frag buf
-    down_link_mtu: int
-    down_frag_buf: bytes = dataclasses.field(default_factory=bytes)
-    down_frag_index: int = 0
-
-    # up frag assembly buf
-    up_link_mtu: int
-    up_frag_buf: dict[int, bytes] = dataclasses.field(default_factory=dict) # int is frag_index
-
-    latest_time: float # timestamp for link time out
-
-# a layered quic conn which is transparently being transfered over a dio link
-@dataclasses.dataclass(kw_only=True)
-class QuicStream:
-    out_sock: socket.socket = dataclasses.field(init=False)
-    out_addr: tuple[str, int] = dataclasses.field(default_factory=tuple) # link.out_addr = quic_server_sock
-    is_localy_closed: bool = False
-
 dio_up_trans = 0 # rebind with link id 0 and (rb magic header) otherwise extra byte in dio header for frag_byte
 dio_up_hearthbeat = 1 # ping with link id 0
 
@@ -231,14 +200,129 @@ dio_frag_mask = 0x7F # 127 == bitwise not 128
 
 conf_dio_link_timeout = 60
 conf_dio_heartbeat_time = 5
+conf_dio_max_packet_age = 10
 
 def pack_dio(dio_enum: int, dio_link: int, data: bytes) -> bytes:
     # print((dio_link << 2 | dio_enum), dio_enum, dio_link)
     return b''.join((b"BD", (dio_link << 2 | dio_enum).to_bytes(1, 'little', signed=False), data))
 
-def pack_dio_frag(dio_enum: int, dio_link: int, frag_index: int, frag_fin: bool, data: bytes) -> bytes:
-    # print((dio_link << 2 | dio_enum), dio_enum, dio_link)
-    return b''.join((b"BD", (dio_link << 2 | dio_enum).to_bytes(1, 'little', signed=False), (frag_fin << 7 | frag_index).to_bytes(1, 'little', signed=False), data))
+def pack_frag(packet_id: int, frag_index: int, frag_fin: bool, data: bytes) -> bytes:
+    return b''.join((packet_id.to_bytes(1, 'little', signed=False), (frag_fin << 7 | frag_index).to_bytes(1, 'little', signed=False), data))
+
+# dio fragment ordering algo: receive and order frag packets until all received
+# if all frags arrived by the time frag_all packet arrives, packet is sent, if not, packet is considered lost (no wait)
+# new in v.9: DioFragmentBuffer can now hold and assemble multiple packets at once without triggering packet loss
+#             frags now contain packet_id which is stored in a single byte, packet loss is triggered when packet_id
+#             of new frags is larger than conf_dio_max_packet_age from the buffered packet
+
+@dataclasses.dataclass(kw_only=True)
+class DioFragmentBuffer:
+    # send frag buf
+    send_frag_buf: bytes = dataclasses.field(default_factory=bytes)
+    send_frag_index: int = 0
+    send_link_mtu: int
+
+    send_current_packet_id: int = 0
+
+    # recv packet frag bufs in [packet_id, [frag_id, frag_data]]
+    recv_frag_bufs: dict[int, dict[int, bytes]] = dataclasses.field(default_factory=dict)
+    recv_link_mtu: int
+
+    def next_packet_id(self) -> int:
+        self.send_current_packet_id = (self.send_current_packet_id + 1) % 255
+        return self.send_current_packet_id
+
+    # receives a packet fragment, returns [packet_data] if all fragments were received, None otherwise
+    def assemble_recv_frag(self, frag_data: bytes, packet_id: int, frag_byte: int) -> bytes | None:
+        frag_buf = self.recv_frag_bufs.get(packet_id, None) # lookup existing frag_buf
+
+        if frag_buf == None:
+            # create new frag buf
+            frag_buf = {}
+            self.recv_frag_bufs[packet_id] = frag_buf
+
+        # cleanup outdated frag bufs (if any)
+        self.recv_frag_bufs.pop((packet_id - conf_dio_max_packet_age) % 255, None)
+
+        if frag_byte & dio_frag_all:
+            self.recv_frag_bufs.pop(packet_id)
+
+            if len(frag_buf) == (dio_frag_mask & frag_byte):
+                # frag packet complete, send
+
+                frag_buf[dio_frag_mask & frag_byte] = frag_data
+                return b''.join(frag_buf.values())
+            else:
+                pass # frag packet incomplete, consider lost; TODO: may remove this line and wait until cleanup time for packet loss
+        else:
+            # frag packet, append to frag_buf
+
+            frag_buf[frag_byte] = frag_data
+        
+        return None
+
+    # returns next frag to send over link, if any, otherwise None
+    def continue_frag_packet(self) -> bytes | None:
+        if len(self.send_frag_buf) == 0:
+            return None
+
+        # link.latest_time = time.time()
+        
+        if len(self.send_frag_buf) <= self.send_link_mtu:
+            frag = self.send_frag_buf
+            frag_index = self.send_frag_index
+            frag_fin = True
+
+            self.send_frag_buf = b""
+            self.send_frag_index = 0
+        else:
+            frag = self.send_frag_buf[:self.send_link_mtu]
+            frag_index = self.send_frag_index
+            frag_fin = False
+
+            self.send_frag_buf = self.send_frag_buf[self.send_link_mtu:]
+            self.send_frag_index += 1
+
+        return pack_frag(self.send_current_packet_id, frag_index, frag_fin, frag)
+
+    # fragments a packet to be send, returns the first frag
+    def initiate_frag_packet(self, data: bytes) -> bytes | None:
+        if len(data) > 127 * self.send_link_mtu:
+            print(f"{warn_escape}warn{reset_escape}: packet exceeded maximum mtu of {127 * self.send_link_mtu} bytes, ignoring...")
+            return None
+
+        is_frag = len(data) > self.send_link_mtu
+
+        if is_frag:
+            self.send_frag_index += 1
+            self.send_frag_buf = data[self.send_link_mtu:]
+            data = data[:self.send_link_mtu]
+
+        #server_sock.sendto(pack_dio_frag(dio_enum, link_id, 0, not is_frag, data), addr)
+        return pack_frag(self.next_packet_id(), 0, not is_frag, data)
+
+@dataclasses.dataclass(kw_only=True)
+class DioLink:
+    out_sock: socket.socket = dataclasses.field(init=False)
+    out_addr: tuple[str, int] = dataclasses.field(default_factory=tuple)
+
+    lazy_addr: tuple[str, int] | None = None
+    down_buffer: list[bytes] = dataclasses.field(default_factory=list) # buffered downstream packets
+
+    frag_buf: DioFragmentBuffer
+
+    latest_time: float # timestamp for link time out
+
+# a layered quic conn which is transparently being transfered over a dio link
+@dataclasses.dataclass(kw_only=True)
+class QuicStream:
+    out_sock: socket.socket = dataclasses.field(init=False)
+    out_addr: tuple[str, int] = dataclasses.field(default_factory=tuple) # link.out_addr = quic_server_sock
+    is_localy_closed: bool = False
+
+#
+# dio server impl
+#
 
 def btr_dio_serve(args: argparse.Namespace):
     try:
@@ -278,70 +362,16 @@ def btr_dio_serve(args: argparse.Namespace):
     
     # == dio fragmentation ==
 
-    # takes and tries to assemble a full packet from dio frag packets
-    def assemble_up_frag(data: bytes, link: DioLink, frag_byte: int) -> None:
-        if frag_byte & dio_frag_all:
-            if len(link.up_frag_buf) == (dio_frag_mask & frag_byte):
-                # frag packet complete, send
-
-                link.up_frag_buf[dio_frag_mask & frag_byte] = data
-                link.out_sock.sendto(b''.join(link.up_frag_buf.values()), link.out_addr)
-            else:
-                pass # frag packet incomplete, consider lost
-            
-            link.up_frag_buf = {}
-        else:
-            # frag packet, append to frag_buf
-
-            link.up_frag_buf[frag_byte] = data
-
-    # continues sending frag packets if there's a frag packet on progress
-    def continue_frag_stream(dio_enum: int, addr: tuple[str, int], link_id: int, link: DioLink) -> bool:
-        if len(link.down_frag_buf) == 0:
-            return False
-
-        link.latest_time = time.time()
-        
-        if len(link.down_frag_buf) <= link.down_link_mtu:
-            frag = link.down_frag_buf
-            frag_index = link.down_frag_index
-            frag_fin = True
-
-            link.down_frag_buf = b""
-            link.down_frag_index = 0
-        else:
-            frag = link.down_frag_buf[:link.down_link_mtu]
-            frag_index = link.down_frag_index
-            frag_fin = False
-
-            link.down_frag_buf = link.down_frag_buf[link.down_link_mtu:]
-            link.down_frag_index += 1
-
-        server_sock.sendto(pack_dio_frag(dio_enum, link_id, frag_index, frag_fin, frag), addr)
-        return True
-
-    # helper that takes care of starting fragmentation if nessesary, only run when no frag transfer in progress
-    def initial_down_stream_transfer(dio_enum: int, addr: tuple[str, int], link_id: int, link: DioLink, data: bytes) -> None:
-        if len(data) > 127 * link.down_link_mtu:
-            if args.verbose:
-                print(f"{warn_escape}warn{reset_escape}: packet exceeded maximum allowed mtu of {127 * link.down_link_mtu} bytes, ignoring...")
-            return
-
-        is_frag = len(data) > link.down_link_mtu
-
-        if is_frag:
-            link.down_frag_index += 1
-            link.down_frag_buf = data[link.down_link_mtu:]
-            data = data[:link.down_link_mtu]
-
-        server_sock.sendto(pack_dio_frag(dio_enum, link_id, 0, not is_frag, data), addr)
-
     # sends down stream packet as a responce to a up stream packet (or starts lazy wait)
     def down_stream(addr: tuple[str, int], link_id: int, link: DioLink) -> None:
         #print(f"down_stream {link_id}, {link.lazy_addr}, {link.down_buffer}")
 
         if not link.lazy_addr == None:
-            if continue_frag_stream(dio_down_buf, link.lazy_addr, link_id, link):
+            frag_data = link.frag_buf.continue_frag_packet()
+            if not frag_data == None:
+                server_sock.sendto(pack_dio(dio_down_buf, link_id, frag_data), link.lazy_addr)
+                
+                link.latest_time = time.time()
                 link.lazy_addr = addr
                 return
 
@@ -349,20 +379,27 @@ def btr_dio_serve(args: argparse.Namespace):
             if len(link.down_buffer) > 0:
                 link.latest_time = time.time() # this is only really here to be in sync with client-side, technically it should not be here
                 
-                initial_down_stream_transfer(dio_down_buf, link.lazy_addr, link_id, link, link.down_buffer.pop(0))
-                link.lazy_addr = addr
+                frag_data = link.frag_buf.initiate_frag_packet(link.down_buffer.pop(0))
+                if not frag_data == None:
+                    server_sock.sendto(pack_dio(dio_down_buf, link_id, frag_data), link.lazy_addr)
             else:
-                server_sock.sendto(pack_dio_frag(dio_down_buf, link_id, 0, True, b''), addr)
-                link.lazy_addr = addr
+                server_sock.sendto(pack_dio(dio_down_trans, link_id, pack_frag(link.frag_buf.next_packet_id(), 0, True, b'')), addr)
+
+            link.lazy_addr = addr
         else:
-            if continue_frag_stream(dio_down_buf, addr, link_id, link):
+            frag_data = link.frag_buf.continue_frag_packet()
+            if not frag_data == None:
+                server_sock.sendto(pack_dio(dio_down_buf, link_id, frag_data), addr)
+                link.latest_time = time.time()
                 return
 
-            #print(f"down_stream_non_lazy {link_id}, {len(link.down_buffer) > 0}, {link.down_buffer}")
             if len(link.down_buffer) > 0: # do not enter lazy if data still buffered but send data with dio_down_buf
                 link.latest_time = time.time() # this is only really here to be in sync with client-side, technically it should not be here
 
-                initial_down_stream_transfer(dio_down_buf, addr, link_id, link, link.down_buffer.pop(0))
+                frag_data = link.frag_buf.initiate_frag_packet(link.down_buffer.pop(0))
+                if not frag_data == None:
+                    server_sock.sendto(pack_dio(dio_down_buf, link_id, frag_data), addr)
+                
             else: # start lazy wait
                 link.lazy_addr = addr
 
@@ -497,11 +534,15 @@ def btr_dio_serve(args: argparse.Namespace):
 
         # TODO: outbound addr tracking
         if not link.lazy_addr == None:
-            if continue_frag_stream(dio_down_buf, link.lazy_addr, link_id, link):
+            frag_data = link.frag_buf.continue_frag_packet()
+            if not frag_data == None:
                 link.down_buffer.append(data) # lazy addr consumed by frag packet, buffer downstream packet    
             else:
-                initial_down_stream_transfer(dio_down_buf, link.lazy_addr, link_id, link, data) # lazy addr consumed -> return dio_down_buf
+                frag_data = link.frag_buf.initiate_frag_packet(data) # lazy addr consumed -> return dio_down_buf
 
+            if not frag_data == None:
+                server_sock.sendto(pack_dio(dio_down_buf, link_id, frag_data), link.lazy_addr)
+            
             link.lazy_addr = None
         else:
             link.down_buffer.append(data)
@@ -547,13 +588,16 @@ def btr_dio_serve(args: argparse.Namespace):
                     # data transfer
 
                     link = active_links.get(stat_link_id, None)
-                    frag_byte: int = int.from_bytes(data[3:4], 'little', signed=False)
+                    packet_byte: int = int.from_bytes(data[3:4], 'little', signed=False)
+                    frag_byte: int = int.from_bytes(data[4:5], 'little', signed=False)
 
                     if not link == None:
                         link.latest_time = time.time()
 
                         # assembles the dio frag packets and sends the full packet if finished
-                        assemble_up_frag(data[4:], link, frag_byte)
+                        packet_data = link.frag_buf.assemble_recv_frag(data[5:], packet_byte, frag_byte)
+                        if not packet_data == None:
+                            link.out_sock.sendto(packet_data, link.out_addr)
 
                         down_stream(addr, stat_link_id, link)
                     else:
@@ -574,14 +618,14 @@ def btr_dio_serve(args: argparse.Namespace):
                 elif stat_enum == dio_up_trans: # and not stat_link_id
                     # special control packet
 
-                    quic_rebind = data.startswith(b'qrb', 3)
+                    quic_rebind = data.startswith(b'qb', 3)
 
                     if quic_rebind or data.startswith(b'rb', 3):
                         # rebind
 
                         for link_id in range(1, 64):
                             if not link_id in active_links:
-                                link = DioLink(latest_time=time.time(), up_link_mtu=int.from_bytes(data[7:9], 'little', signed=False), down_link_mtu=int.from_bytes(data[9:11], 'little', signed=False))
+                                link = DioLink(latest_time=time.time(), frag_buf=DioFragmentBuffer(recv_link_mtu=int.from_bytes(data[7:9], 'little', signed=False), send_link_mtu=int.from_bytes(data[9:11], 'little', signed=False)))
                                 link.out_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
                                 print(f"{bold_escape}info{reset_escape}: accepted a new {'quic' if quic_rebind else ''} rebind request with link_id {link_id}")
@@ -597,7 +641,7 @@ def btr_dio_serve(args: argparse.Namespace):
 
                                     link.out_addr = quic_server_sock.getsockname() # qrb port is ignored here and is communicated inside the quic conn
                                     
-                                    quic_thread = threading.Thread(target=quic_daemon, args=(data[12:], quic_server_sock), daemon=True)
+                                    quic_thread = threading.Thread(target=quic_daemon, args=(data[11:], quic_server_sock), daemon=True)
                                     quic_thread.start()
 
                                     quic_threads[link_id] = (quic_thread, quic_server_sock)
@@ -648,11 +692,8 @@ class DioClientLink:
     owning_tunnel: DioTunnel
     local_addr: tuple[str, int] 
 
-    # frag assebly is described in dio-serve
-    down_frag_buf: dict[int, bytes] = dataclasses.field(default_factory=dict)
-
-    up_frag_buf: bytes = dataclasses.field(default_factory=bytes)
-    up_frag_index: int = 0
+    # frag assembly is described in dio-serve
+    frag_buf: DioFragmentBuffer
 
     timestamp: float
     heartbeat_timestamp: float
@@ -685,8 +726,8 @@ def btr_dio_tunnel(args: argparse.Namespace):
     active_links: dict[int, DioClientLink] = {}
     relay_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
-    up_relay_mtu: int = 15
-    down_relay_mtu: int = 15
+    up_relay_mtu: int = 20
+    down_relay_mtu: int = 30
 
     sel = selectors.DefaultSelector()
     
@@ -710,48 +751,6 @@ def btr_dio_tunnel(args: argparse.Namespace):
         if args.verbose:
             print(f"{bold_escape}verbose{reset_escape}: new dio udp tunnel for {tunnel_ports[0]}:{tunnel_ports[1]}")
 
-    # takes and tries to assemble a full packet from dio frag packets
-    def assemble_down_frag(data: bytes, link: DioClientLink, frag_byte: int) -> None:
-        if frag_byte & dio_frag_all:
-            if len(link.down_frag_buf) == (dio_frag_mask & frag_byte):
-                # frag packet complete, send
-
-                link.down_frag_buf[dio_frag_mask & frag_byte] = data
-                link.owning_tunnel.tun_sock.sendto(b''.join(link.down_frag_buf.values()), link.local_addr)
-            else:
-                pass # frag packet incomplete, consider lost
-            
-            link.down_frag_buf = {}
-        else:
-            # frag packet, append to frag_buf
-
-            link.down_frag_buf[frag_byte] = data
-
-    # continues sending frag packets if there's a frag packet on progress
-    def continue_frag_stream(link_id: int, link: DioClientLink) -> bool:
-        if len(link.up_frag_buf) == 0:
-            return False
-
-        link.timestamp = time.time()
-        
-        if len(link.up_frag_buf) <= up_relay_mtu:
-            frag = link.up_frag_buf
-            frag_index = link.up_frag_index
-            frag_fin = True
-
-            link.up_frag_buf = b""
-            link.up_frag_index = 0
-        else:
-            frag = link.up_frag_buf[:up_relay_mtu]
-            frag_index = link.up_frag_index
-            frag_fin = False
-
-            link.up_frag_buf = link.up_frag_buf[up_relay_mtu:]
-            link.up_frag_index += 1
-
-        relay_sock.sendto(pack_dio_frag(dio_up_trans, link_id, frag_index, frag_fin, frag), relay_addr)
-        return True
-
     # helper that takes care of fragmentation if nessesary
     def inbound_up_stream(link_id: int, link: DioClientLink, data: bytes):
         if len(data) > 127 * up_relay_mtu:
@@ -762,12 +761,21 @@ def btr_dio_tunnel(args: argparse.Namespace):
         is_frag = len(data) > up_relay_mtu
 
         if is_frag:
-            link.up_frag_buf = data
+            frag_data = link.frag_buf.initiate_frag_packet(data)
+            if frag_data == None:
+                return
 
-            while continue_frag_stream(link_id, link):
+            relay_sock.sendto(pack_dio(dio_up_trans, link_id, frag_data), relay_addr)
+
+            while True:
+                frag_data = link.frag_buf.continue_frag_packet() # continue_frag_stream(link_id, link)
+                if frag_data == None:
+                    break
+                    
+                relay_sock.sendto(pack_dio(dio_up_trans, link_id, frag_data), relay_addr)
                 pass # TODO: wait here to not get rate limit?
         else:
-            relay_sock.sendto(pack_dio_frag(dio_up_trans, link_id, 0, True, data), relay_addr)
+            relay_sock.sendto(pack_dio(dio_up_trans, link_id, pack_frag(link.frag_buf.next_packet_id(), 0, True, data)), relay_addr)
 
     def tunnel_read(tun: DioTunnel):
         data, local_addr = tun.tun_sock.recvfrom(32768)
@@ -798,7 +806,7 @@ def btr_dio_tunnel(args: argparse.Namespace):
                         print(f"{error_escape}error{reset_escape}: original_destination_connection_id not assigned to a quic tunnel before rebind, this is a bug, ignoring...")
                         continue
 
-                    temp_sock.sendto(pack_dio(dio_up_trans, 0, b''.join((b"qrb", b"\x00\x00", up_relay_mtu.to_bytes(2, 'little', signed=False), down_relay_mtu.to_bytes(2, 'little', signed=False), tun.original_destination_connection_id))), relay_addr)
+                    temp_sock.sendto(pack_dio(dio_up_trans, 0, b''.join((b"qb", b"\x00\x00", up_relay_mtu.to_bytes(2, 'little', signed=False), down_relay_mtu.to_bytes(2, 'little', signed=False), tun.original_destination_connection_id))), relay_addr)
 
                 read_socks, _, _ = select.select([temp_sock], [], [], .5)
                 if len(read_socks) == 0:
@@ -821,7 +829,7 @@ def btr_dio_tunnel(args: argparse.Namespace):
 
                     link_id = int.from_bytes(rb_data[5:6], 'little', signed=False)
                     tun.active_link_ids[local_addr] = link_id
-                    link = DioClientLink(owning_tunnel=tun, local_addr=local_addr, timestamp=time.time(), heartbeat_timestamp=0)
+                    link = DioClientLink(owning_tunnel=tun, local_addr=local_addr, timestamp=time.time(), heartbeat_timestamp=0, frag_buf=DioFragmentBuffer(send_link_mtu=up_relay_mtu, recv_link_mtu=down_relay_mtu))
                     active_links[link_id] = link
 
                     print(f"{bold_escape}info{reset_escape}: establised a new dio link (id: {link_id}) for {local_addr}")
@@ -870,11 +878,11 @@ def btr_dio_tunnel(args: argparse.Namespace):
                         inactive_addrs.append(addr)
 
                         print(f"{bold_escape}info{reset_escape}: assuming link id: {link_id} to be inactive")
-                    elif min(time.time() - active_links[link_id].heartbeat_timestamp, time.time() - active_links[link_id].timestamp) > conf_dio_heartbeat_time or len(active_links[link_id].down_frag_buf) != 0:
+                    elif min(time.time() - active_links[link_id].heartbeat_timestamp, time.time() - active_links[link_id].timestamp) > conf_dio_heartbeat_time or len(active_links[link_id].frag_buf.recv_frag_bufs) != 0:
                         active_links[link_id].heartbeat_timestamp = time.time()
                         relay_sock.sendto(pack_dio(dio_up_hearthbeat, link_id, b""), relay_addr)
 
-                        if len(active_links[link_id].down_frag_buf) != 0:
+                        if len(active_links[link_id].frag_buf.recv_frag_bufs) != 0:
                             cleanup_finished = False
                     
                 for addr in inactive_addrs:
@@ -1081,13 +1089,16 @@ def btr_dio_tunnel(args: argparse.Namespace):
 
             # dio down
             if stat_enum == dio_down_trans or stat_enum == dio_down_buf:
-                frag_byte: int = int.from_bytes(data[3:4], 'little', signed=False)
+                packet_byte: int = int.from_bytes(data[3:4], 'little', signed=False)
+                frag_byte: int = int.from_bytes(data[4:5], 'little', signed=False)
 
-                if data[4:] == b"":
+                if data[5:] == b"":
                     continue
 
-                assemble_down_frag(data[4:], link, frag_byte)
                 link.timestamp = time.time()
+                packet_data = link.frag_buf.assemble_recv_frag(data[5:], packet_byte, frag_byte)
+                if not packet_data == None:
+                    link.owning_tunnel.tun_sock.sendto(packet_data, link.local_addr)
 
                 if stat_enum == dio_down_buf:
                     # packets are still buffered with no lazy addr on relay
@@ -1122,7 +1133,7 @@ if __name__ == "__main__":
     `./btr.py route-chrome localhost:1080 --chrome-exec chromium`
     `./btr.py direct-tun blahblah_wont_be_used my_relay.net -t 5646:22`""")
 
-    print("By-The-Rules Utilities v0.8")
+    print("By-The-Rules Utilities v0.9")
     
     print("""   ___ _________ 
   / _ )_  __/ _ \\
