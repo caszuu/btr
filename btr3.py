@@ -464,7 +464,8 @@ def btr_dio_serve(args: argparse.Namespace):
 
                 quic_server.receive_datagram(dgram[0], dgram[1], now)
 
-            quic_server.handle_timer(now)
+            if not quic_server.get_timer() == None:
+                quic_server.handle_timer(now)
             send_traffic()
 
             while True:
@@ -633,7 +634,7 @@ def btr_dio_serve(args: argparse.Namespace):
                                 link = DioLink(latest_time=time.time(), frag_buf=DioFragmentBuffer(recv_link_mtu=int.from_bytes(data[7:9], 'little', signed=False), send_link_mtu=int.from_bytes(data[9:11], 'little', signed=False)))
                                 link.out_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-                                print(f"{bold_escape}info{reset_escape}: accepted a new {'quic' if quic_rebind else ''} rebind request with link_id {link_id}")
+                                print(f"{bold_escape}info{reset_escape}: accepted a new {'quic ' if quic_rebind else ''}rebind request with link_id {link_id}")
 
                                 active_links[link_id] = link
                                 outbound_selector.register(link.out_sock, selectors.EVENT_READ, (link_id, link))
@@ -1015,7 +1016,8 @@ def btr_dio_tunnel(args: argparse.Namespace):
 
                     print(f"{bold_escape}info{reset_escape}: established a new quic stream for {new_conn[1]}")
 
-            quic_client.handle_timer(now)
+            if not quic_client.get_timer() == None:
+                quic_client.handle_timer(now)
             send_traffic()
 
             while True:
