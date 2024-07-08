@@ -318,7 +318,10 @@ class DioLink:
 class QuicStream:
     out_sock: socket.socket = dataclasses.field(init=False)
     out_addr: tuple[str, int] = dataclasses.field(default_factory=tuple) # link.out_addr = quic_server_sock
+    
     is_localy_closed: bool = False
+    is_localy_fin: bool = False
+    is_remotely_fin: bool = False
 
 #
 # dio server impl
@@ -427,16 +430,32 @@ def btr_dio_serve(args: argparse.Namespace):
                     for e, mask in events:
                         sock = e.fileobj
 
-                        data = sock.recv(32768)
+                        try:
+                            data = sock.recv(32768)
 
-                        if data:
-                            quic_server.send_stream_data(e.data, data)
-                        else:
-                            quic_server.stop_stream(e.data, 0)
+                            if data:
+                                quic_server.send_stream_data(e.data, data)
+                            else:
+                                # assume a local tcp FIN bit -> end_stream
+
+                                quic_server.send_stream_data(e.data, b'', end_stream=True) 
+                                quic_streams[e.data].is_localy_fin = True
+                                quic_sel.unregister(sock)
+
+                                if quic_streams[e.data].is_remotely_fin:
+                                    # closed on both sides, clean up stream
+
+                                    sock.close()
+                                    quic_streams.pop(e.data)
+
+                        except ConnectionResetError:
+                            # assume a local tcp RST bit -> reset_stream
+
+                            quic_server.reset_stream(e.data, 0)
 
                             quic_sel.unregister(sock)
                             sock.close()
-                            quic_streams[e.data].is_localy_closed = True
+                            quic_streams.pop(e.data)
                     
                     if not len(events) == 0:
                         send_traffic()
@@ -499,26 +518,38 @@ def btr_dio_serve(args: argparse.Namespace):
                                 quic_server.reset_stream(e.stream_id, 0)
                                 continue
 
-                        elif stream.is_localy_closed:
+                        if stream.is_localy_closed:
                             continue
 
-                        stream.out_sock.send(e.data)
+                        try: stream.out_sock.send(e.data)
+                        except OSError: pass # ignore errors from protocols which close on their own
 
                         if e.end_stream:
-                            # cleanup old stream
+                            # emulate remote tcp FIN bit
 
-                            quic_sel.unregister(stream.out_sock)
-                            stream.out_sock.close()
-                            quic_streams.pop(e.stream_id)
+                            try: stream.out_sock.shutdown(1)
+                            except OSError: pass # ignore errors from protocols which close on their own
+                            
+                            stream.is_remotely_fin = True
+
+                            if stream.is_localy_fin:
+                                # closed on both sides, clean up stream
+
+                                stream.out_sock.close()
+                                quic_streams.pop(e.stream_id) 
+
+                            continue
                     
-                    elif isinstance(e, StopSendingReceived) or isinstance(e, StreamReset):
+                    elif isinstance(e, StreamReset):
                         stream = quic_streams.get(e.stream_id, None)
 
                         if not stream == None:
+                            # emulate remote (or local?) tcp RST bit and clean up
+
                             if not stream.is_localy_closed:
                                 quic_sel.unregister(stream.out_sock)
                                 stream.out_sock.close()
-                            quic_streams.pop(e.stream_id)
+                            quic_streams.pop(e.stream_id) 
 
                 except:
                     print(f"{warn_escape}warn{reset_escape}: exception occured in quic_daemon, trying to continue...")
@@ -691,7 +722,10 @@ class DioTunnel:
 class ClientQuicStream:
     inbound_sock: socket.socket
     peer_addr: tuple[str, int]
+
     is_localy_closed: bool = False
+    is_localy_fin: bool = False
+    is_remotely_fin: bool = False
 
 @dataclasses.dataclass(kw_only=True)
 class DioClientLink:
@@ -966,16 +1000,34 @@ def btr_dio_tunnel(args: argparse.Namespace):
                     for e, mask in events:
                         sock = e.fileobj
 
-                        data = sock.recv(32768)
+                        try:
+                            data = sock.recv(32768)
 
-                        if data:
-                            quic_client.send_stream_data(e.data, data)
-                        else:
-                            quic_client.stop_stream(e.data, 0)
+                            if data:
+                                quic_client.send_stream_data(e.data, data)
+                            else:
+                                # assume a local tcp FIN bit -> end_stream
+
+                                quic_client.send_stream_data(e.data, b'', end_stream=True) 
+                                quic_streams[e.data].is_localy_fin = True
+                                quic_sel.unregister(sock)
+
+                                if quic_streams[e.data].is_remotely_fin:
+                                    # closed on both sides, clean up stream
+
+                                    print(f"{bold_escape}info{reset_escape}: closing quic stream for {quic_streams[e.data].peer_addr}")
+
+                                    sock.close()
+                                    quic_streams.pop(e.data)
+
+                        except ConnectionResetError:
+                            # assume a local tcp RST bit -> reset_stream
+
+                            quic_client.reset_stream(e.data, 0)
 
                             quic_sel.unregister(sock)
                             sock.close()
-                            quic_streams[e.data].is_localy_closed = True
+                            quic_streams.pop(e.data)
                     
                     if not len(events) == 0:
                         send_traffic()
@@ -1032,27 +1084,39 @@ def btr_dio_tunnel(args: argparse.Namespace):
                         if stream.is_localy_closed:
                             continue
 
-                        stream.inbound_sock.send(e.data)
+                        try: stream.inbound_sock.send(e.data)
+                        except OSError: pass # ignore errors from protocols which close on their own
 
                         if e.end_stream:
-                            # cleanup old stream
+                            # emulate remote tcp FIN bit
 
-                            print(f"{bold_escape}info{reset_escape}: closing quic stream for {stream.peer_addr}")
+                            try: stream.inbound_sock.shutdown(1)
+                            except OSError: pass # ignore errors from protocols which close on their own
+                            
+                            stream.is_remotely_fin = True
 
-                            quic_sel.unregister(stream.inbound_sock)
-                            stream.inbound_sock.close()
-                            quic_streams.pop(e.stream_id)
+                            if stream.is_localy_fin:
+                                # closed on both sides, clean up stream
+
+                                print(f"{bold_escape}info{reset_escape}: closing quic stream for {stream.peer_addr}")
+
+                                stream.inbound_sock.close()
+                                quic_streams.pop(e.stream_id) 
+
+                            continue
                     
-                    if isinstance(e, StopSendingReceived) or isinstance(e, StreamReset):
+                    elif isinstance(e, StreamReset):
                         stream = quic_streams.get(e.stream_id, None)
 
                         if not stream == None:
+                            # emulate remote (or local?) tcp RST bit and clean up
+
                             print(f"{bold_escape}info{reset_escape}: closing quic stream for {stream.peer_addr}")
 
                             if not stream.is_localy_closed:
                                 quic_sel.unregister(stream.inbound_sock)
                                 stream.inbound_sock.close()
-                            quic_streams.pop(e.stream_id)
+                            quic_streams.pop(e.stream_id) 
 
                 except:
                     print(f"{warn_escape}warn{reset_escape}: exception occured in quic_daemon, trying to continue...")
@@ -1088,6 +1152,7 @@ def btr_dio_tunnel(args: argparse.Namespace):
                 print(f"{error_escape}error{reset_escape}: unexpected link_id 0 special packet with enum {stat_enum}, this is a bug, ignoring...")
                 continue
 
+            # FIXME: it's possible to get spammed by this when a dio link get overloaded and becomes inactive before it recovers (i think)
             if not stat_link_id in active_links:
                 print(f"{error_escape}error{reset_escape}: received data from link not attached to this device, this is a bug, ignoring...")
                 continue
