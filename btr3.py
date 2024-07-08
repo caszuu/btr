@@ -484,14 +484,19 @@ def btr_dio_serve(args: argparse.Namespace):
                                 quic_server.stop_stream(e.stream_id, 201)
                                 continue
 
-                            stream = QuicStream(out_addr=(args.relay_dest, int.from_bytes(e.data[3:5], 'little', signed=False)))
-                            stream.out_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            stream.out_sock.connect(stream.out_addr)
+                            try:
+                                stream = QuicStream(out_addr=(args.relay_dest, int.from_bytes(e.data[3:5], 'little', signed=False)))
+                                stream.out_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                stream.out_sock.connect(stream.out_addr)
 
-                            quic_sel.register(stream.out_sock, selectors.EVENT_READ, e.stream_id)
+                                quic_sel.register(stream.out_sock, selectors.EVENT_READ, e.stream_id)
 
-                            e.data = e.data[5:]
-                            quic_streams[e.stream_id] = stream
+                                e.data = e.data[5:]
+                                quic_streams[e.stream_id] = stream
+                            
+                            except OSError:
+                                quic_server.reset_stream(e.stream_id, 0)
+                                continue
 
                         elif stream.is_localy_closed:
                             continue
